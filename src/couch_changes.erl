@@ -69,13 +69,9 @@ handle_changes(Args1, Req, Db0) ->
         fun(CallbackAcc) ->
             {Callback, UserAcc} = get_callback_acc(CallbackAcc),
             Self = self(),
-            {ok, Notify} = couch_db_update_notifier:start_link(
-                fun({_, DbName}) when  Db0#db.name == DbName ->
-                    Self ! db_updated;
-                (_) ->
-                    ok
-                end
-            ),
+            couch_event:subscribe_cond(db_updated, [{{'$1', '_'},
+                                                     [{'==', '$1', Db0#db.name}],
+                                                     ['_']}]),
             {Db, StartSeq} = Start(),
             UserAcc2 = start_sending_changes(Callback, UserAcc, Feed),
             {Timeout, TimeoutFun} = get_changes_timeout(Args, Callback),
@@ -87,7 +83,7 @@ handle_changes(Args1, Req, Db0) ->
                     Acc0,
                     true)
             after
-                couch_db_update_notifier:stop(Notify),
+                couch_event:unsubscribe(db_updated),
                 get_rest_db_updated(ok) % clean out any remaining update messages
             end
         end;
@@ -531,24 +527,24 @@ deleted_item(_) -> [].
 % waits for a db_updated msg, if there are multiple msgs, collects them.
 wait_db_updated(Timeout, TimeoutFun, UserAcc) ->
     receive
-    db_updated ->
-        get_rest_db_updated(UserAcc)
+        {couch_event, db_updated, _} ->
+            get_rest_db_updated(UserAcc)
     after Timeout ->
-        {Go, UserAcc2} = TimeoutFun(UserAcc),
-        case Go of
-        ok ->
-            wait_db_updated(Timeout, TimeoutFun, UserAcc2);
-        stop ->
-            {stop, UserAcc2}
-        end
+              {Go, UserAcc2} = TimeoutFun(UserAcc),
+              case Go of
+                  ok ->
+                      wait_db_updated(Timeout, TimeoutFun, UserAcc2);
+                  stop ->
+                      {stop, UserAcc2}
+              end
     end.
 
 get_rest_db_updated(UserAcc) ->
     receive
-    db_updated ->
-        get_rest_db_updated(UserAcc)
+        {couch_event, db_updated, _} ->
+            get_rest_db_updated(UserAcc)
     after 0 ->
-        {updated, UserAcc}
+              {updated, UserAcc}
     end.
 
 reset_heartbeat() ->
