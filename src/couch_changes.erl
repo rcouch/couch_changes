@@ -12,6 +12,8 @@
 
 -module(couch_changes).
 -include_lib("couch/include/couch_db.hrl").
+-include_lib("couch_mrview/include/couch_mrview.hrl").
+-include("couch_changes.hrl").
 
 -export([handle_changes/3]).
 
@@ -44,18 +46,47 @@ handle_changes(Args1, Req, Db0) ->
         dir = Dir,
         since = Since
     } = Args1,
-    {FilterFun, FilterArgs} = make_filter_fun(FilterName, Style, Req, Db0),
-    Args = Args1#changes_args{filter_fun = FilterFun, filter_args = FilterArgs},
-    Start = fun() ->
-        {ok, Db} = couch_db:reopen(Db0),
-        StartSeq = case Dir of
-        rev ->
-            couch_db:get_update_seq(Db);
-        fwd ->
-            Since
-        end,
-        {Db, StartSeq}
+
+
+    {Start, Args} = case FilterName of
+        "_view" ->
+            couch_log:info("filter is a view~n", []),
+            ViewArgs = make_view_args(Req),
+            {DDoc, VName} = parse_view_param(Req),
+            Args2 = Args1#changes_args{filter_fun= no_filter_fun(Style),
+                                       filter_args=ViewArgs,
+                                       view_name={DDoc, VName}},
+            Start1 = fun() ->
+                             {ok, Infos} = couch_mrview:get_view_info(Db0#db.name,
+                                                                      DDoc, VName),
+                             StartSeq = case Dir of
+                                            rev ->
+                                                proplists:get_value(group_seq,
+                                                                    Infos, 0);
+                                            fwd ->
+                                                Since
+                                        end,
+                             {ok, Db} = couch_db:reopen(Db0),
+                             {Db, StartSeq}
+                     end,
+            {Start1, Args2};
+        _ ->
+            {FilterFun, FilterArgs} = make_filter_fun(FilterName, Style, Req, Db0),
+            Args2 = Args1#changes_args{filter_fun = FilterFun,
+                                      filter_args = FilterArgs},
+            Start1 = fun() ->
+                            {ok, Db} = couch_db:reopen(Db0),
+                            StartSeq = case Dir of
+                                           rev ->
+                                               couch_db:get_update_seq(Db);
+                                           fwd ->
+                                               Since
+                                       end,
+                            {Db, StartSeq}
+                    end,
+            {Start1, Args2}
     end,
+
     % begin timer to deal with heartbeat when filter function fails
     case Args#changes_args.heartbeat of
     undefined ->
@@ -69,9 +100,27 @@ handle_changes(Args1, Req, Db0) ->
         fun(CallbackAcc) ->
             {Callback, UserAcc} = get_callback_acc(CallbackAcc),
             Self = self(),
-            couch_event:subscribe_cond(db_updated, [{{'$1', '_'},
-                                                     [{'==', '$1', Db0#db.name}],
-                                                     ['_']}]),
+
+            {Event, DDocId} = case FilterName of
+                "_view" ->
+                    #changes_args{view_name={DDocId1, _}} = Args,
+                    %% start indexer
+                    couch_index_server:acquire_indexer(couch_mrview_index,
+                                                       Db0#db.name, DDocId1),
+                    %% subscribe to event
+                    couch_event:subscribe_cond(index_update,
+                                               [{{'_', '$1', '$2', '_'},
+                                                 [{'==', '$1', Db0#db.name},
+                                                  {'==', '$2', DDocId1}],
+                                                 [true]}]),
+
+                    {index_update, DDocId1};
+                _ ->
+                    couch_event:subscribe_cond(db_updated, [{{'$1', '_'},
+                                                             [{'==', '$1', Db0#db.name}],
+                                                             [true]}]),
+                    {db_updated, nil}
+            end,
             {Db, StartSeq} = Start(),
             UserAcc2 = start_sending_changes(Callback, UserAcc, Feed),
             {Timeout, TimeoutFun} = get_changes_timeout(Args, Callback),
@@ -83,7 +132,15 @@ handle_changes(Args1, Req, Db0) ->
                     Acc0,
                     true)
             after
-                couch_event:unsubscribe(db_updated),
+                couch_event:unsubscribe(Event),
+                case FilterName of
+                    "_view" ->
+                        couch_index_server:release_indexer(couch_mrview_index,
+                                                           Db0#db.name,
+                                                           DDocId);
+                    _ ->
+                        ok
+                end,
                 get_rest_db_updated(ok) % clean out any remaining update messages
             end
         end;
@@ -104,6 +161,14 @@ handle_changes(Args1, Req, Db0) ->
         end
     end.
 
+make_view_args(#httpd{method=Method}=Req) ->
+    Query = couch_httpd:qs(Req),
+    parse_view_options(Query, false, []);
+make_view_args({json_req, {Props}}=Req) ->
+    {Query} = couch_util:get_value(<<"query">>, Props, {[]}),
+    parse_view_options(Query, true, []).
+
+
 get_callback_acc({Callback, _UserAcc} = Pair) when is_function(Callback, 3) ->
     Pair;
 get_callback_acc(Callback) when is_function(Callback, 2) ->
@@ -114,6 +179,13 @@ make_filter_fun([$_ | _] = FilterName, Style, Req, Db) ->
     builtin_filter_fun(FilterName, Style, Req, Db);
 make_filter_fun(FilterName, Style, Req, Db) ->
     {os_filter_fun(FilterName, Style, Req, Db), []}.
+
+
+no_filter_fun(Style) ->
+    fun(Db, #doc_info{revs=Revs}) ->
+        builtin_results(Style, Revs)
+    end.
+
 
 os_filter_fun(FilterName, Style, Req, Db) ->
     case [list_to_binary(couch_httpd:unquote(Part))
@@ -163,9 +235,6 @@ builtin_filter_fun("_doc_ids", Style, #httpd{method='GET'}=Req, _Db) ->
     {filter_docids(DocIds, Style), DocIds};
 builtin_filter_fun("_design", Style, _Req, _Db) ->
     {filter_designdoc(Style), []};
-builtin_filter_fun("_view", Style, Req, Db) ->
-    ViewName = couch_httpd:qs_value(Req, "view", ""),
-    {filter_view(ViewName, Style, Db), []};
 builtin_filter_fun(_FilterName, _Style, _Req, _Db) ->
     throw({bad_request, "unknown builtin filter name"}).
 
@@ -188,39 +257,6 @@ filter_designdoc(Style) ->
                 _ -> []
             end
     end.
-
-filter_view("", _Style, _Db) ->
-    throw({bad_request, "`view` filter parameter is not provided."});
-filter_view(ViewName, Style, Db) ->
-    case [list_to_binary(couch_httpd:unquote(Part))
-            || Part <- string:tokens(ViewName, "/")] of
-        [] ->
-            throw({bad_request, "Invalid `view` parameter."});
-        [DName, VName] ->
-            DesignId = <<"_design/", DName/binary>>,
-            DDoc = couch_httpd_db:couch_doc_open(Db, DesignId, nil, [ejson_body]),
-            % validate that the ddoc has the filter fun
-            #doc{body={Props}} = DDoc,
-            couch_util:get_nested_json_value({Props}, [<<"views">>, VName]),
-            fun(Db2, DocInfo) ->
-                DocInfos =
-                case Style of
-                main_only ->
-                    [DocInfo];
-                all_docs ->
-                    [DocInfo#doc_info{revs=[Rev]}|| Rev <- DocInfo#doc_info.revs]
-                end,
-                Docs = [Doc || {ok, Doc} <- [
-                        couch_db:open_doc(Db2, DocInfo2, [deleted, conflicts])
-                            || DocInfo2 <- DocInfos]],
-                {ok, Passes} = couch_query_servers:filter_view(
-                    DDoc, VName, Docs
-                ),
-                [{[{<<"rev">>, couch_doc:rev_to_str({RevPos,RevId})}]}
-                    || {Pass, #doc{revs={RevPos,[RevId|_]}}}
-                    <- lists:zip(Passes, Docs), Pass == true]
-            end
-        end.
 
 builtin_results(Style, [#rev_info{rev=Rev}|_]=Revs) ->
     case Style of
@@ -295,7 +331,8 @@ send_changes(Args, Acc0, FirstRound) ->
     #changes_args{
         dir = Dir,
         filter = FilterName,
-        filter_args = FilterArgs
+        filter_args = FilterArgs,
+        view_name = ViewName
     } = Args,
     #changes_acc{
         db = Db,
@@ -310,13 +347,27 @@ send_changes(Args, Acc0, FirstRound) ->
         "_design" ->
             send_changes_design_docs(
                 Db, StartSeq, Dir, fun changes_enumerator/2, Acc0);
+        "_view" ->
+            {DDoc, VName} = ViewName,
+            io:format("filter args ~p~n", [FilterArgs]),
+            couch_mrview:view_changes_since(
+              Db#db.name, DDoc, VName, StartSeq, fun view_changes_enumerator/2, FilterArgs, Acc0);
+
         _ ->
             couch_db:changes_since(
                 Db, StartSeq, fun changes_enumerator/2, [{dir, Dir}], Acc0)
         end;
     false ->
-        couch_db:changes_since(
-            Db, StartSeq, fun changes_enumerator/2, [{dir, Dir}], Acc0)
+        case FilterName of
+            "_view" ->
+                {DDoc, VName} = ViewName,
+                io:format("filter args ~p~n", [FilterArgs]),
+                couch_mrview:view_changes_since(
+                    Db#db.name, DDoc, VName, StartSeq, fun view_changes_enumerator/2, FilterArgs, Acc0);
+            _ ->
+                couch_db:changes_since(
+                    Db, StartSeq, fun changes_enumerator/2, [{dir, Dir}], Acc0)
+        end
     end.
 
 
@@ -397,10 +448,7 @@ keep_sending_changes(Args, Acc0, FirstRound) ->
         db_open_options = DbOptions
     } = Args,
 
-    {ok, ChangesAcc} = send_changes(
-        Args#changes_args{dir=fwd},
-        Acc0,
-        FirstRound),
+    {ok, ChangesAcc} = send_changes(Args#changes_args{dir=fwd}, Acc0, FirstRound),
     #changes_acc{
         db = Db, callback = Callback, timeout = Timeout, timeout_fun = TimeoutFun,
         seq = EndSeq, prepend = Prepend2, user_acc = UserAcc2, limit = NewLimit
@@ -436,7 +484,26 @@ keep_sending_changes(Args, Acc0, FirstRound) ->
 end_sending_changes(Callback, UserAcc, EndSeq, ResponseType) ->
     Callback({stop, EndSeq}, ResponseType, UserAcc).
 
-changes_enumerator(DocInfo, #changes_acc{resp_type = ResponseType} = Acc)
+view_changes_enumerator({{Seq, _Key, DocId}, _Val}, Acc) ->
+    #changes_acc{db = Db0} = Acc,
+    {ok, Db} = couch_db:reopen(Db0),
+
+    case couch_db:get_doc_info(Db, DocId) of
+        {ok, DocInfo} ->
+           changes_enumerator(DocInfo, Acc, Seq);
+        {error, not_found} ->
+            {ok, Acc};
+        not_found ->
+            {ok, Acc};
+        Error ->
+            throw(Error)
+    end.
+
+changes_enumerator(DocInfo, Acc) ->
+    changes_enumerator(DocInfo, Acc, nil).
+
+changes_enumerator(DocInfo, #changes_acc{resp_type = ResponseType} = Acc,
+                   ViewSeq)
         when ResponseType =:= "continuous"
         orelse ResponseType =:= "eventsource" ->
     #changes_acc{
@@ -444,7 +511,8 @@ changes_enumerator(DocInfo, #changes_acc{resp_type = ResponseType} = Acc)
         user_acc = UserAcc, limit = Limit, db = Db,
         timeout = Timeout, timeout_fun = TimeoutFun
     } = Acc,
-    #doc_info{high_seq = Seq} = DocInfo,
+    #doc_info{high_seq = Seq0} = DocInfo,
+    Seq = use_seq(Seq0, ViewSeq),
     Results0 = FilterFun(Db, DocInfo),
     Results = [Result || Result <- Results0, Result /= null],
     %% TODO: I'm thinking this should be < 1 and not =< 1
@@ -459,18 +527,19 @@ changes_enumerator(DocInfo, #changes_acc{resp_type = ResponseType} = Acc)
             {Go, Acc#changes_acc{seq = Seq, user_acc = UserAcc2}}
         end;
     _ ->
-        ChangesRow = changes_row(Results, DocInfo, Acc),
+        ChangesRow = changes_row(Results, DocInfo, Acc, Seq),
         UserAcc2 = Callback({change, ChangesRow, <<>>}, ResponseType, UserAcc),
         reset_heartbeat(),
         {Go, Acc#changes_acc{seq = Seq, user_acc = UserAcc2, limit = Limit - 1}}
     end;
-changes_enumerator(DocInfo, Acc) ->
+changes_enumerator(DocInfo, Acc, ViewSeq) ->
     #changes_acc{
         filter = FilterFun, callback = Callback, prepend = Prepend,
         user_acc = UserAcc, limit = Limit, resp_type = ResponseType, db = Db,
         timeout = Timeout, timeout_fun = TimeoutFun
     } = Acc,
-    #doc_info{high_seq = Seq} = DocInfo,
+    #doc_info{high_seq = Seq0} = DocInfo,
+    Seq = use_seq(Seq0, ViewSeq),
     Results0 = FilterFun(Db, DocInfo),
     Results = [Result || Result <- Results0, Result /= null],
     Go = if (Limit =< 1) andalso Results =/= [] -> stop; true -> ok end,
@@ -484,7 +553,7 @@ changes_enumerator(DocInfo, Acc) ->
             {Go, Acc#changes_acc{seq = Seq, user_acc = UserAcc2}}
         end;
     _ ->
-        ChangesRow = changes_row(Results, DocInfo, Acc),
+        ChangesRow = changes_row(Results, DocInfo, Acc, Seq),
         UserAcc2 = Callback({change, ChangesRow, Prepend}, ResponseType, UserAcc),
         reset_heartbeat(),
         {Go, Acc#changes_acc{
@@ -493,9 +562,9 @@ changes_enumerator(DocInfo, Acc) ->
     end.
 
 
-changes_row(Results, DocInfo, Acc) ->
+changes_row(Results, DocInfo, Acc, Seq) ->
     #doc_info{
-        id = Id, high_seq = Seq, revs = [#rev_info{deleted = Del} | _]
+        id = Id, revs = [#rev_info{deleted = Del} | _]
     } = DocInfo,
     #changes_acc{
         db = Db,
@@ -524,10 +593,16 @@ changes_row(Results, DocInfo, Acc) ->
 deleted_item(true) -> [{<<"deleted">>, true}];
 deleted_item(_) -> [].
 
+use_seq(Seq, nil) -> Seq;
+use_seq(_, ViewSeq) -> ViewSeq.
+
 % waits for a db_updated msg, if there are multiple msgs, collects them.
 wait_db_updated(Timeout, TimeoutFun, UserAcc) ->
     receive
-        {couch_event, db_updated, _} ->
+        {couch_event, db_updated, _}=Ev ->
+            couch_log:info("got db update ~p~n", [Ev]),
+            get_rest_db_updated(UserAcc);
+        {couch_event, index_update, _} ->
             get_rest_db_updated(UserAcc)
     after Timeout ->
               {Go, UserAcc2} = TimeoutFun(UserAcc),
@@ -542,6 +617,8 @@ wait_db_updated(Timeout, TimeoutFun, UserAcc) ->
 get_rest_db_updated(UserAcc) ->
     receive
         {couch_event, db_updated, _} ->
+            get_rest_db_updated(UserAcc);
+        {couch_event, index_update, _} ->
             get_rest_db_updated(UserAcc)
     after 0 ->
               {updated, UserAcc}
@@ -571,3 +648,100 @@ maybe_heartbeat(Timeout, TimeoutFun, Acc) ->
             {ok, Acc}
         end
     end.
+
+
+
+
+%% view changes items
+%%
+
+parse_view_param({json_req, {Props}}) ->
+    {Query} = couch_util:get_value(<<"query">>, Props),
+    parse_view_param1(couch_util:get_value(<<"view">>, Query, <<"">>));
+parse_view_param(Req) ->
+    parse_view_param1(list_to_binary(couch_httpd:qs_value(Req, "view", ""))).
+
+parse_view_param1(ViewParam) ->
+    case re:split(ViewParam, <<"/">>) of
+        [DName, ViewName] ->
+            {<< "_design/", DName/binary >>, ViewName};
+        _ ->
+            throw({bad_request, "Invalid `view` parameter."})
+    end.
+
+parse_view_options([], _JsonReq, Acc) ->
+    Acc;
+
+parse_view_options(Options, true, Acc) ->
+     %% get list of view attributes
+    ViewFields0 = [couch_util:to_binary(F) || F <- record_info(fields,  mrargs)],
+    ViewFields = [<<"key">> | ViewFields0],
+
+    [{K, V} || {K, V} <- Options, lists:member(K, ViewFields)];
+parse_view_options([{K, V} | Rest], JsonReq, Acc) ->
+    Acc1 = case couch_util:to_binary(K) of
+        <<"reduce">> ->
+            [{reduce, couch_mrview_http:parse_boolean(V)}];
+        <<"key">> ->
+            V1 = parse_json(V, JsonReq),
+            [{start_key, V1}, {end_key, V1} | Acc];
+        <<"keys">> ->
+            [{keys, parse_json(V, JsonReq)} | Acc];
+        <<"startkey">> ->
+            [{start_key, parse_json(V, JsonReq)} | Acc];
+        <<"start_key">> ->
+            [{start_key, parse_json(V, JsonReq)} | Acc];
+        <<"startkey_docid">> ->
+            [{start_key_docid, couch_util:to_binary(V)} | Acc];
+        <<"start_key_docid">> ->
+            [{start_key_docid, couch_util:to_binary(V)} | Acc];
+        <<"endkey">> ->
+            [{end_key, parse_json(V, JsonReq)} | Acc];
+        <<"end_key">> ->
+            [{end_key, parse_json(V, JsonReq)} | Acc];
+        <<"endkey_docid">> ->
+            [{start_key_docid, couch_util:to_binary(V)} | Acc];
+        <<"end_key_docid">> ->
+            [{start_key_docid, couch_util:to_binary(V)} | Acc];
+        <<"limit">> ->
+            [{limit, couch_mrview_http:parse_pos_int(V)} | Acc];
+        <<"count">> ->
+            throw({query_parse_error, <<"QS param `count` is not `limit`">>});
+        <<"stale">> when V =:= <<"ok">> orelse V =:= "ok" ->
+            [{stale, ok} | Acc];
+        <<"stale">> when V =:= <<"update_after">> orelse V =:= "update_after" ->
+            [{stale, update_after} | Acc];
+        <<"stale">> ->
+            throw({query_parse_error, <<"Invalid value for `stale`.">>});
+        <<"descending">> ->
+            case couch_mrview_http:parse_boolean(V) of
+                true ->
+                    [{direction, rev} | Acc];
+                _ ->
+                    [{direction, fwd} | Acc]
+            end;
+        <<"skip">> ->
+            [{skip, couch_mrview_http:parse_pos_int(V)} | Acc];
+        <<"group">> ->
+            case couch_mrview_http:parse_booolean(V) of
+                true ->
+                    [{group_level, exact} | Acc];
+                _ ->
+                    [{group_level, 0} | Acc]
+            end;
+        <<"group_level">> ->
+            [{group_level, couch_mrview_http:parse_pos_int(V)} | Acc];
+        <<"inclusive_end">> ->
+            [{inclusive_end, couch_mrview_http:parse_boolean(V)}];
+        _ ->
+            Acc
+    end,
+    parse_view_options(Rest, JsonReq, Acc1).
+
+parse_json(V, true) when is_binary(V) ->
+    ?JSON_DECODE(V);
+parse_json(V, false) when is_list(V) ->
+    ?JSON_DECODE(V);
+parse_json(V, _) ->
+    V.
+
