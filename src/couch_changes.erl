@@ -360,7 +360,6 @@ send_changes(Args, Acc0, FirstRound) ->
         case FilterName of
             "_view" ->
                 {DDoc, VName} = ViewName,
-                io:format("filter args ~p~n", [FilterArgs]),
                 couch_mrview:view_changes_since(
                     Db#db.name, DDoc, VName, StartSeq, fun view_changes_enumerator/2, FilterArgs, Acc0);
             _ ->
@@ -483,14 +482,21 @@ keep_sending_changes(Args, Acc0, FirstRound) ->
 end_sending_changes(Callback, UserAcc, EndSeq, ResponseType) ->
     Callback({stop, EndSeq}, ResponseType, UserAcc).
 
-view_changes_enumerator({{Seq, _Key, DocId}, Val}, Acc) ->
+view_changes_enumerator({{Seq, _Key, DocId}, Val}=Row, Acc) ->
     #changes_acc{db = Db0} = Acc,
     {ok, Db} = couch_db:reopen(Db0),
 
-
     case couch_db:get_doc_info(Db, DocId) of
-        {ok, DocInfo} when Val /= removed ->
-           changes_enumerator(DocInfo, Acc, Seq);
+        {ok, DocInfo} ->
+            #doc_info{revs = [#rev_info{deleted = Del} | _]} = DocInfo,
+            case {Val, Del} of
+                {removed, true} ->
+                    changes_enumerator(DocInfo, Acc, Seq);
+                {removed, _} ->
+                    {ok, Acc};
+                _ ->
+                    changes_enumerator(DocInfo, Acc, Seq)
+            end;
         {ok, _DocInfo} ->
             {ok, Acc};
         {error, not_found} ->
