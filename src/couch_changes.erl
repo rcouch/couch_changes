@@ -50,7 +50,6 @@ handle_changes(Args1, Req, Db0) ->
 
     {Start, Args} = case FilterName of
         "_view" ->
-            couch_log:info("filter is a view~n", []),
             ViewArgs = make_view_args(Req),
             {DDoc, VName} = parse_view_param(Req),
             Args2 = Args1#changes_args{filter_fun= no_filter_fun(Style),
@@ -488,17 +487,16 @@ view_changes_enumerator({{Seq, _Key, DocId}, Val}=Row, Acc) ->
 
     case couch_db:get_doc_info(Db, DocId) of
         {ok, DocInfo} ->
-            #doc_info{revs = [#rev_info{deleted = Del} | _]} = DocInfo,
+            #doc_info{revs = [#rev_info{deleted = Del}=Rev | Rest]} = DocInfo,
             case {Val, Del} of
                 {removed, true} ->
-                    changes_enumerator(DocInfo, Acc, Seq);
+                    changes_enumerator(DocInfo, Acc#changes_acc{db = Db}, Seq);
                 {removed, _} ->
-                    {ok, Acc};
+                    DocInfo1= DocInfo#doc_info{revs=[Rev#rev_info{deleted=removed} | Rest]},
+                    changes_enumerator(DocInfo1, Acc#changes_acc{db = Db}, Seq);
                 _ ->
-                    changes_enumerator(DocInfo, Acc, Seq)
+                    changes_enumerator(DocInfo, Acc#changes_acc{db = Db}, Seq)
             end;
-        {ok, _DocInfo} ->
-            {ok, Acc};
         {error, not_found} ->
             {ok, Acc};
         not_found ->
@@ -599,6 +597,7 @@ changes_row(Results, DocInfo, Acc, Seq) ->
         end}.
 
 deleted_item(true) -> [{<<"deleted">>, true}];
+deleted_item(removed) -> [{<<"removed">>, true}];
 deleted_item(_) -> [].
 
 use_seq(Seq, nil) -> Seq;
@@ -608,7 +607,6 @@ use_seq(_, ViewSeq) -> ViewSeq.
 wait_db_updated(Timeout, TimeoutFun, UserAcc) ->
     receive
         {couch_event, db_updated, _}=Ev ->
-            couch_log:info("got db update ~p~n", [Ev]),
             get_rest_db_updated(UserAcc);
         {couch_event, index_update, _} ->
             get_rest_db_updated(UserAcc)
